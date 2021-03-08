@@ -46,6 +46,14 @@ kpsr::bst::ClientStateMachine::ClientStateMachine(Environment * environment,
                                  _bstClientMiddlewareProvider->getBst2KpsrReplyMessageSubscriber(),
                                  _flightPlanCorrelator.correlationFunction)
     , _telemetrySystemEventListener(telemetrySystemEventListener)
+    , _waitTime(500)
+    , _retryCounter(0)
+    , _maxRetry(1)
+    , _takeoffTime(250)
+    , _afterArmTime(2000)
+    , _waitForGyrosTime(7000)
+    , _isWaiting(false)
+    , _isRetryEnabled(false)
 {}
 
 void kpsr::bst::ClientStateMachine::start() {
@@ -73,11 +81,22 @@ void kpsr::bst::ClientStateMachine::sendControlCommandAndUpdateOnAck(unsigned ch
     message.type = type;
     message.value = value;
 
-    _callbackHandler.requestAndReply(message, [this, eventPrefix](const kpsr::bst::BstReplyMessage & reply) {
+    _callbackHandler.requestAndReply(message, [&, this, eventPrefix](const kpsr::bst::BstReplyMessage & reply) {
+
+    spdlog::info("sendControlCommandAndUpdateOnAck - retryCounter: {}", _retryCounter);
         if (reply.ack) {
+            _isRetryEnabled = false;
             _stateMachine->enqueueEvent(eventPrefix + "AckRx");
+            spdlog::info("enqueueEvent ACK: {}AckRx", eventPrefix);
+        } else if (_isRetryEnabled && (_retryCounter <= _maxRetry)){
+            _stateMachine->enqueueEvent("retry");
+            _retryCounter++;
+            spdlog::info("event retry: {},  counter:{}", eventPrefix, _retryCounter);
+
         } else {
+             _isRetryEnabled = false;
             _stateMachine->enqueueEvent(eventPrefix + "NackRx");
+            spdlog::info("enqueueEvent NACK: {}NackRx", eventPrefix);
         }
     });
 }
@@ -142,6 +161,47 @@ void kpsr::bst::ClientStateMachine::addActionsOnReadyState() {
                                     "bst_state_machine_payloadcontrol", "validFlightModeRx", "notValidFlightModeRx");
     });
 
+    _clientStateMachineListener.addPeriodicAction("waitPayloadControl", [this](const std::string & eventId) {
+        spdlog::info("{}. waitPayloadControl.", __PRETTY_FUNCTION__);
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        if(!_isWaiting){
+            _beginWait=std::chrono::steady_clock::now();
+            _isWaiting=true;
+            spdlog::info("startWaiting: waitPayloadControl");
+        }else if(std::chrono::duration_cast<std::chrono::milliseconds>(now - _beginWait).count()>_takeoffTime){
+            spdlog::info("{}. enqueueEvent waitCompleted", __PRETTY_FUNCTION__);
+            _stateMachine->enqueueEvent("waitCompleted");
+            _isWaiting=false;
+        }
+    });
+
+    _clientStateMachineListener.addPeriodicAction("waitForZeroGyros", [this](const std::string & eventId) {
+        spdlog::info("{}. waitForZeroGyros.", __PRETTY_FUNCTION__);
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        if(!_isWaiting){
+            _beginWait=std::chrono::steady_clock::now();
+            _isWaiting=true;
+            spdlog::info("startWaiting: waitForZeroGyros");
+        }else if(std::chrono::duration_cast<std::chrono::milliseconds>(now - _beginWait).count()>_waitForGyrosTime){
+            spdlog::info("{}. enqueueEvent waitCompleted", __PRETTY_FUNCTION__);
+            _stateMachine->enqueueEvent("waitCompleted");
+            _isWaiting=false;
+        }
+    });
+
+    _clientStateMachineListener.addAction("sendGyroReq", [this](const std::string & eventId) {
+        spdlog::info("{}. sendGyroReq accepted.", __PRETTY_FUNCTION__);
+        kpsr::bst::BstRequestMessage calibMsg;
+        calibMsg.id = SENSORS_CALIBRATE;
+        calibMsg.type = GYROSCOPE;
+        calibMsg.value = SENT;
+
+        _callbackHandler.requestAndReply(calibMsg, [this](const kpsr::bst::BstReplyMessage & reply) {
+        });
+        _stateMachine->enqueueEvent("gyroSent");
+    });
+
+
     _clientStateMachineListener.addAction("preFlightReq", [this](const std::string & eventId) {
         spdlog::info("{}. preFlight mode requested.", __PRETTY_FUNCTION__);
         if (_telemetrySystemEventListener->getLastReceivedEvent()->flight_mode == FLIGHT_MODE_PREFLIGHT ||
@@ -159,6 +219,7 @@ void kpsr::bst::ClientStateMachine::addActionsOnReadyState() {
 
     _clientStateMachineListener.addAction("launchModeReq", [this](const std::string & eventId) {
         spdlog::info("{}. launch mode requested.", __PRETTY_FUNCTION__);
+        _isRetryEnabled = true;
         if (_telemetrySystemEventListener->getLastReceivedEvent()->flight_mode == FLIGHT_MODE_PREFLIGHT) {
             spdlog::debug("{}. launch mode requested. sendControlCommandAndUpdateOnAck", __PRETTY_FUNCTION__);
             sendControlCommandAndUpdateOnAck(CMD_FLIGHT_MODE, FLIGHT_MODE_LAUNCH, "launchModeReq");
@@ -175,11 +236,13 @@ void kpsr::bst::ClientStateMachine::addActionsOnReadyState() {
 
     _clientStateMachineListener.addAction("enableEngineReq", [this](const std::string & eventId) {
         spdlog::info("{}. kill engine requested.", __PRETTY_FUNCTION__);
+        _isRetryEnabled = true;
         sendControlCommandAndUpdateOnAck(CMD_ENGINE_KILL, 0, "enableEngineReq");
     });
 
     _clientStateMachineListener.addAction("launchReq", [this](const std::string & eventId) {
         spdlog::info("{}. launch requested.", __PRETTY_FUNCTION__);
+        _isRetryEnabled = true;
         sendControlCommandAndUpdateOnAck(CMD_LAUNCH, 1, "launchReq");
     });
 
@@ -202,6 +265,86 @@ void kpsr::bst::ClientStateMachine::addActionsOnReadyState() {
         spdlog::info("{}. paylonad control off requested.", __PRETTY_FUNCTION__);
         sendControlCommandAndUpdateOnAck(CMD_PAYLOAD_CONTROL, PAYLOAD_CTRL_OFF, "payloadControlOff");
     });
+
+    _clientStateMachineListener.addPeriodicAction("flightPlanReqWait", [this](const std::string & eventId) {
+        spdlog::info("{}. flightPlanReqWait.", __PRETTY_FUNCTION__);
+
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+
+        if(!_isWaiting){
+            _beginWait=std::chrono::steady_clock::now();
+            _isWaiting=true;
+            spdlog::info("startWaiting: flightPlanReqWait");
+        }else if(std::chrono::duration_cast<std::chrono::milliseconds>(now - _beginWait).count()>_waitTime){
+            spdlog::info("{}. enqueueEvent waitCompleted", __PRETTY_FUNCTION__);
+            _stateMachine->enqueueEvent("waitCompleted");
+            _isWaiting=false;
+        }
+        
+    });
+
+    _clientStateMachineListener.addPeriodicAction("controlCommandReqWait", [this](const std::string & eventId) {
+        spdlog::info("{}. controlCommandReqWait.", __PRETTY_FUNCTION__);
+
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+
+        if(!_isWaiting){
+            _beginWait=std::chrono::steady_clock::now();
+            _isWaiting=true;
+            spdlog::info("startWaiting: controlCommandReqWait");
+        }else if(std::chrono::duration_cast<std::chrono::milliseconds>(now - _beginWait).count()>_waitTime){
+            spdlog::info("{}. enqueueEvent waitCompleted", __PRETTY_FUNCTION__);
+            _stateMachine->enqueueEvent("waitCompleted");
+            _isWaiting=false;
+        }
+    });
+    _clientStateMachineListener.addPeriodicAction("enableEngineReqWait", [this](const std::string & eventId) {
+        spdlog::info("{}. enableEngineReqWait.", __PRETTY_FUNCTION__);
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+
+        if(!_isWaiting){
+            _beginWait=std::chrono::steady_clock::now();
+            _isWaiting=true;
+            spdlog::info("startWaiting: enableEngineReqWait");
+        }else if(std::chrono::duration_cast<std::chrono::milliseconds>(now - _beginWait).count()>_takeoffTime){
+            spdlog::info("{}. enqueueEvent waitCompleted", __PRETTY_FUNCTION__);
+            _stateMachine->enqueueEvent("waitCompleted");
+            _isWaiting=false;
+        }
+        
+    });
+    _clientStateMachineListener.addPeriodicAction("launchReqWait", [this](const std::string & eventId) {
+        spdlog::info("{}. launchReqWait.", __PRETTY_FUNCTION__);
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+
+        if(!_isWaiting){
+            _beginWait=std::chrono::steady_clock::now();
+            _isWaiting=true;
+            spdlog::info("startWaiting: launchReqWait");
+        }else if(std::chrono::duration_cast<std::chrono::milliseconds>(now - _beginWait).count()>_afterArmTime){
+            spdlog::info("{}. enqueueEvent waitCompleted", __PRETTY_FUNCTION__);
+            _stateMachine->enqueueEvent("waitCompleted");
+            _isWaiting=false;
+        }
+        
+    });
+    _clientStateMachineListener.addPeriodicAction("launchModeReqWait", [this](const std::string & eventId) {
+        spdlog::info("{}. launchModeReqWait.", __PRETTY_FUNCTION__);
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        if(!_isWaiting){
+            _beginWait=std::chrono::steady_clock::now();
+            _isWaiting=true;
+            spdlog::info("startWaiting: launchModeReqWait");
+        }else if(std::chrono::duration_cast<std::chrono::milliseconds>(now - _beginWait).count()>_takeoffTime){
+            spdlog::info("{}. enqueueEvent waitCompleted", __PRETTY_FUNCTION__);
+            _stateMachine->enqueueEvent("waitCompleted");
+            _isWaiting=false;
+        }
+        
+    });
+
+
+    
 }
 
 void kpsr::bst::ClientStateMachine::sendCommand(const kpsr::bst::BstRequestMessage & command) {
@@ -239,10 +382,10 @@ bool kpsr::bst::ClientStateMachine::sendWaypoints(const WaypointCommandMessage &
         _flightPlanCallbackHandler.requestAndReply(command, [this](const kpsr::bst::BstReplyMessage & reply) {
             if (reply.ack) {
                 spdlog::warn("Flight Plan reply.ack: {}", reply.ack);
-                _stateMachine->enqueueEvent("flightPlanReqAckRx");
+                 _stateMachine->enqueueEvent("flightPlanReqAckRx");
             } else {
                 spdlog::warn("Flight Plan reply.ack: {}", reply.ack);
-                _stateMachine->enqueueEvent("flightPlanReqNackRx");
+                 _stateMachine->enqueueEvent("flightPlanReqNackRx");
             }
         });
     });

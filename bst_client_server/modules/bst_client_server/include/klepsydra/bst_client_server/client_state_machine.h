@@ -33,6 +33,7 @@
 #include <klepsydra/bst_client_server/client_state_machine_conf.h>
 
 #include <spdlog/spdlog.h>
+#include <chrono>
 
 namespace kpsr {
 namespace bst {
@@ -73,6 +74,10 @@ private:
     kpsr::MultiThreadCallbackHandler<kpsr::bst::BstRequestMessage, kpsr::bst::BstReplyMessage> _callbackHandler;
     kpsr::MultiThreadCallbackHandler<kpsr::bst::WaypointCommandMessage, kpsr::bst::BstReplyMessage> _flightPlanCallbackHandler;
     kpsr::mem::CacheListener<TelemetrySystem_t> * _telemetrySystemEventListener;
+    std::chrono::steady_clock::time_point _beginWait;
+    int _waitTime, _retryCounter, _maxRetry, _takeoffTime, _afterArmTime, _waitForGyrosTime;
+
+    bool _isWaiting, _isRetryEnabled;
 };
 }
 }

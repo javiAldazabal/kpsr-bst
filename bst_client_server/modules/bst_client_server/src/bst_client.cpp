@@ -111,7 +111,7 @@ bool kpsr::bst::BstClient::releasePayloadControl() {
 }
 
 bool kpsr::bst::BstClient::takeoff() {
-    if (* _clientStateMachineListener.getLastReceivedEvent().get() == "bstClientStateMachine:payloadControlReady") {
+    if (* _clientStateMachineListener.getLastReceivedEvent().get() == "bstClientStateMachine:ready") {
         _clientStateMachineExtPublisher->publish("takeoffReqRx");
         return true;
     }

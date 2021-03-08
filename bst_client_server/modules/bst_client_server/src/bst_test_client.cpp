@@ -135,7 +135,7 @@ void BstTestClient::updateClient() {
 
         case 't':
             spdlog::info("Launch / Land command ...");
-            if (_bstClient.getCurrentState() == "bstClientStateMachine:payloadControlReady") {
+            if (_bstClient.getCurrentState() == "bstClientStateMachine:ready") {
                 spdlog::info("Sending take off command...");
                 _bstClient.takeoff();
             } else if (_bstClient.getCurrentState() == "bstClientStateMachine:flying") {
